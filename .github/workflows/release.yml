@@ -1,0 +1,125 @@
+name: Build & Release
+
+# Trigger on pushed version tags: v1.0.0, v2.3.1, etc.
+# To release: git tag v1.2.3 && git push origin v1.2.3
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write  # needed to create GitHub Releases and upload assets
+
+jobs:
+  build:
+    name: Build & Release
+    runs-on: ubuntu-latest  # cross-compile from Linux — no Windows runner needed
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so git describe works
+
+      # ── Go toolchain ─────────────────────────────────────────────────────────
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod   # reads the `go` directive from go.mod
+          cache: true               # cache module downloads between runs
+
+      # ── Gather build metadata ─────────────────────────────────────────────────
+      - name: Set build metadata
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME}"                        # e.g. v1.2.3
+          COMMIT="${GITHUB_SHA::8}"                           # short SHA
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}"
+
+          echo "version=${VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "commit=${COMMIT}"     >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}"         >> "$GITHUB_OUTPUT"
+          echo "ldflags=${LDFLAGS}"   >> "$GITHUB_OUTPUT"
+
+      # ── Download modules ──────────────────────────────────────────────────────
+      - name: Download modules
+        run: go mod download
+
+      # ── Build matrix ─────────────────────────────────────────────────────────
+      # dnsman is Windows-only (//go:build windows), so we only build
+      # windows/amd64 and windows/arm64.
+      - name: Build windows/amd64
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go build \
+            -trimpath \
+            -ldflags "${{ steps.meta.outputs.ldflags }}" \
+            -o "dist/dnsman-${{ steps.meta.outputs.version }}-windows-amd64.exe" \
+            .
+
+      - name: Build windows/arm64
+        env:
+          GOOS: windows
+          GOARCH: arm64
+          CGO_ENABLED: "0"
+        run: |
+          go build \
+            -trimpath \
+            -ldflags "${{ steps.meta.outputs.ldflags }}" \
+            -o "dist/dnsman-${{ steps.meta.outputs.version }}-windows-arm64.exe" \
+            .
+
+      # ── Checksum file ─────────────────────────────────────────────────────────
+      - name: Generate SHA256 checksums
+        run: |
+          cd dist
+          sha256sum *.exe > "dnsman-${{ steps.meta.outputs.version }}-checksums.txt"
+          cat "dnsman-${{ steps.meta.outputs.version }}-checksums.txt"
+
+      # ── Generate release notes from git log ───────────────────────────────────
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get the previous tag so we can scope the changelog.
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${{ steps.meta.outputs.version }}$" | head -n1)
+
+          if [ -z "$PREV_TAG" ]; then
+            # First ever release — include all commits.
+            LOG=$(git log --pretty="- %s (%h)" HEAD)
+          else
+            LOG=$(git log --pretty="- %s (%h)" "${PREV_TAG}..HEAD")
+          fi
+
+          # Write to a temp file to handle multi-line safely.
+          {
+            echo "## What's changed"
+            echo ""
+            echo "${LOG}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "**Full diff:** [\`${PREV_TAG}\` → \`${{ steps.meta.outputs.version }}\`](../../compare/${PREV_TAG}...${{ steps.meta.outputs.version }})"
+            echo ""
+            echo "**Built:** ${{ steps.meta.outputs.date }}"
+            echo "**Commit:** \`${{ steps.meta.outputs.commit }}\`"
+          } > release-notes.md
+
+          cat release-notes.md
+
+      # ── Create GitHub Release & upload assets ─────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "dnsman ${{ steps.meta.outputs.version }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}  # v1.0.0-beta → pre-release
+          files: |
+            dist/dnsman-${{ steps.meta.outputs.version }}-windows-amd64.exe
+            dist/dnsman-${{ steps.meta.outputs.version }}-windows-arm64.exe
+            dist/dnsman-${{ steps.meta.outputs.version }}-checksums.txt
