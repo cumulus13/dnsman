@@ -1,4 +1,4 @@
-// dnsman: Windows DNS manager — zero PowerShell, zero net.exe, zero ipconfig.
+	// dnsman: Windows DNS manager — zero PowerShell, zero net.exe, zero ipconfig.
 //
 // Implementation uses only:
 //   - Windows Registry  (golang.org/x/sys/windows/registry)   → read/write DNS servers
@@ -36,9 +36,12 @@ import (
 // ── Version (injected via -ldflags) ─────────────────────────────────────────
 
 var (
-	version = "1.0.1"
+	version = "1.0.3"
 	commit  = "dev"
 	date    = "2026/04/27"
+	author  = "Hadi Cahyadi"
+	email   = "cumulus13@gmail.com"
+	homepage = "github.com/cumulus13/dnsman"
 )
 
 // ── DNS presets ──────────────────────────────────────────────────────────────
@@ -89,7 +92,7 @@ func printBanner() {
   ██║  ██║██║╚██╗██║╚════██║    ██║╚██╔╝██║██║   ██║██╔══██╗
   ██████╔╝██║ ╚████║███████║    ██║ ╚═╝ ██║╚██████╔╝██║  ██║
   ╚═════╝ ╚═╝  ╚═══╝╚══════╝    ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝`)
-	dim.Printf("  DNS Manager v%s (%s) — built %s\n\n", version, commit, date)
+	dim.Printf("  DNS Manager v%s (%s) — built %s by %s\n\n", version, commit, date, author)
 }
 
 // ── Adapter enumeration via GetAdaptersAddresses ─────────────────────────────
@@ -555,6 +558,15 @@ func cmdListAdapters() error {
 	return nil
 }
 
+func colors(hex, text string) string {
+	if hex == "" {
+		return text
+	}
+	var r, g, b int
+	fmt.Sscanf(hex, "#%02x%02x%02x", &r, &g, &b)
+	return fmt.Sprintf("\x1b[38;2;%d;%d;%dm%s\x1b[0m", r, g, b, text)
+}
+
 func cmdShow(ifaceName string) error {
 	sep()
 	bold.Println("  Current DNS Configuration")
@@ -592,28 +604,31 @@ func cmdShow(ifaceName string) error {
 
 	const col = 20
 	for _, a := range targets {
-		cyan.Printf("  %-*s  %s\n", col, "Interface:", a.Name)
-		dim.Printf("  %-*s  %s\n", col, "Description:", a.Description)
+		// cyan.Printf("  %-*s  %s\n", col, "Interface:", a.Name)
+		fmt.Printf("  %-*s  %s\n", col, "Interface:", colors("#00FFFF", a.Name))
+		// dim.Printf("  %-*s  %s\n", col, "Description:", a.Description)
+		fmt.Printf("  %-*s  %s\n", col, "Description:", colors("#AAAAFF", a.Description))
 
 		static, dhcp, _ := getRegistryDNS(a.GUID)
 
 		if len(static) > 0 {
-			green.Printf("  %-*s  %s\n", col, "Static DNS:", strings.Join(static, "  "))
+			green.Printf("  %-*s  %s\n", col, "Static DNS:", colors("#FFFF00", strings.Join(static, "  ")))
 		} else {
-			dim.Printf("  %-*s  %s\n", col, "Static DNS:", "(none — using DHCP)")
+			// dim.Printf("  %-*s  %s\n", col, "Static DNS:", "(none — using DHCP)")
+			fmt.Printf("  %-*s  %s\n", col, "Static DNS:", colors("#FFAA7F", "DHCP"))
 		}
 		if len(dhcp) > 0 {
-			dim.Printf("  %-*s  %s\n", col, "DHCP DNS:", strings.Join(dhcp, "  "))
+			dim.Printf("  %-*s  %s\n", col, "DHCP DNS:", colors("#FF557F", strings.Join(dhcp, "  ")))
 		}
 		if len(a.IPv4DNS) > 0 {
-			fmt.Printf("  %-*s  %s\n", col, "Active IPv4 DNS:", strings.Join(a.IPv4DNS, "  "))
+			fmt.Printf("  %-*s  %s\n", col, "Active IPv4 DNS:", colors("#0000FF", strings.Join(a.IPv4DNS, "  ")))
 		}
 		if len(a.IPv6DNS) > 0 {
-			fmt.Printf("  %-*s  %s\n", col, "Active IPv6 DNS:", strings.Join(a.IPv6DNS, "  "))
+			fmt.Printf("  %-*s  %s\n", col, "Active IPv6 DNS:", colors("#5500FF", strings.Join(a.IPv6DNS, "  ")))
 		}
-		dhcpStr := "No"
+		dhcpStr := colors("#FF55FF", "No")
 		if a.DHCPEnabled {
-			dhcpStr = "Yes"
+			dhcpStr = colors("#00AAFF", "Yes")
 		}
 		dim.Printf("  %-*s  %s\n", col, "DHCP Enabled:", dhcpStr)
 		sep()
@@ -949,9 +964,11 @@ func main() {
 		Short: "Print version, commit hash, and build date",
 		Run: func(cmd *cobra.Command, args []string) {
 			sep()
-			bold.Printf("  dnsman   v%s\n", version)
+			bold.Printf("  dnsman   v%s\n", colors("#00FFFF", version))
 			dim.Printf("  Commit   %s\n", commit)
 			dim.Printf("  Built    %s\n", date)
+			fmt.Printf("  Author   %s <%s>\n", colors("#FFFF00", author), colors("#AAAAFF", email))
+			fmt.Printf("  %s\n", colors("#FFAA7F", homepage))
 			sep()
 		},
 	}
