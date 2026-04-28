@@ -1,4 +1,4 @@
-	// dnsman: Windows DNS manager — zero PowerShell, zero net.exe, zero ipconfig.
+// dnsman: Windows DNS manager — zero PowerShell, zero net.exe, zero ipconfig.
 //
 // Implementation uses only:
 //   - Windows Registry  (golang.org/x/sys/windows/registry)   → read/write DNS servers
@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -36,7 +37,7 @@ import (
 // ── Version (injected via -ldflags) ─────────────────────────────────────────
 
 var (
-	version = "1.0.3"
+	version = "1.0.4"
 	commit  = "dev"
 	date    = "2026/04/27"
 	author  = "Hadi Cahyadi"
@@ -507,7 +508,7 @@ func restartService(name string) error {
 
 // ── Commands ─────────────────────────────────────────────────────────────────
 
-func cmdListAdapters() error {
+func cmdListAdapters(pattern string) error {
 	sep()
 	bold.Println("  Network Adapters")
 	sep()
@@ -522,18 +523,26 @@ func cmdListAdapters() error {
 		return nil
 	}
 
-	names := make([]string, 0, len(adapters))
-	for n := range adapters {
-		names = append(names, n)
+	// Build target list — all adapters, or filtered by pattern.
+	var targets []*Adapter
+	if pattern != "" {
+		targets, err = matchAdapters(pattern, adapters)
+		if err != nil {
+			return err
+		}
+		dim.Printf("  Filter: %q  (%d match(es))\n", pattern, len(targets))
+		sep()
+	} else {
+		for _, a := range adapters {
+			targets = append(targets, a)
+		}
+		sort.Slice(targets, func(i, j int) bool { return targets[i].Name < targets[j].Name })
 	}
-	sort.Strings(names)
 
-	const col = 32 // visual column width for adapter name column
-	for _, name := range names {
-		a := adapters[name]
-
-		// Name + DHCP/Static badge on same line.
-		cyan.Printf("  %-*s", col, name)
+	const col = 32
+	for _, a := range targets {
+		// Name + DHCP/Static/Loopback badge.
+		cyan.Printf("  %-*s", col, a.Name)
 		if a.IsLoopback {
 			dim.Printf("  Loopback\n")
 		} else if a.DHCPEnabled {
@@ -553,7 +562,7 @@ func cmdListAdapters() error {
 	}
 
 	sep()
-	dim.Println("  Use the interface name with --interface / -i (supports wildcards and regex).")
+	dim.Println("  Tip: -i supports exact name, wildcards (*VMnet*), and regex.")
 	sep()
 	return nil
 }
@@ -760,16 +769,59 @@ func cmdReset(ifaceName string) error {
 	return cmdShow(ifaceName)
 }
 
-func cmdTest(host string) error {
+func cmdTest(host, ifaceName string) error {
 	sep()
 	bold.Println("  DNS Resolution Test")
 	sep()
 	infoMsg(fmt.Sprintf("Host: %s", host))
+
+	// Build a custom resolver if a specific interface was requested,
+	// so the query goes through that adapter's DNS server directly.
+	resolver := net.DefaultResolver
+	if ifaceName != "" {
+		adapters, err := getAdapters()
+		if err != nil {
+			return err
+		}
+		matched, err := matchAdapters(ifaceName, adapters)
+		if err != nil {
+			return err
+		}
+		a := matched[0]
+		ifaceName = a.Name
+
+		// Prefer static registry DNS, fall back to active IPv4 DNS.
+		static, _, _ := getRegistryDNS(a.GUID)
+		var servers []string
+		if len(static) > 0 {
+			servers = static
+		} else {
+			servers = a.IPv4DNS
+		}
+
+		if len(servers) == 0 {
+			warnMsg(fmt.Sprintf("No DNS servers on %q — falling back to system default", ifaceName))
+		} else {
+			infoMsg(fmt.Sprintf("Via interface : %s", ifaceName))
+			infoMsg(fmt.Sprintf("Using DNS     : %s", strings.Join(servers, "  ")))
+			primary := servers[0]
+			if !strings.Contains(primary, ":") {
+				primary = net.JoinHostPort(primary, "53")
+			}
+			d := &net.Dialer{}
+			resolver = &net.Resolver{
+				PreferGo: true,
+				Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return d.DialContext(ctx, "udp", primary)
+				},
+			}
+		}
+	}
 	sep()
 
 	stepMsg("⏳", fmt.Sprintf("Resolving %s ...", host))
 	start := time.Now()
-	addrs, err := net.LookupHost(host)
+	addrs, err := resolver.LookupHost(context.Background(), host)
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -791,7 +843,7 @@ func cmdTest(host string) error {
 	// Reverse PTR on first result.
 	if len(addrs) > 0 {
 		stepMsg("⏳", fmt.Sprintf("Reverse lookup for %s ...", addrs[0]))
-		if names, e := net.LookupAddr(addrs[0]); e == nil && len(names) > 0 {
+		if names, e := resolver.LookupAddr(context.Background(), addrs[0]); e == nil && len(names) > 0 {
 			dim.Printf("  %-*s  %s\n", col, "PTR:", strings.Join(names, ", "))
 		} else {
 			dim.Printf("  %-*s  %s\n", col, "PTR:", "(no PTR record)")
@@ -824,14 +876,6 @@ func cmdListPresets() {
 func main() {
 	printBanner()
 
-	var (
-		ifaceName     string
-		named         bool
-		preset        string
-		testHost      string
-		extraFallback bool
-	)
-
 	root := &cobra.Command{
 		Use:           "dnsman",
 		Short:         "Windows DNS manager — no PowerShell, no net.exe, no ipconfig",
@@ -840,30 +884,37 @@ func main() {
 	}
 
 	// ── adapters ─────────────────────────────────────────────────────────────
+	var adaptersIface string
 	adaptersCmd := &cobra.Command{
 		Use:   "adapters",
 		Short: "List all network adapters, DNS mode, and active DNS servers",
-		RunE:  func(cmd *cobra.Command, args []string) error { return cmdListAdapters() },
+		Example: `  dnsman adapters
+  dnsman adapters -i "*VMnet*"
+  dnsman adapters -i "Wi-Fi*"
+  dnsman adapters -i "(?i)wireless"`,
+		RunE: func(cmd *cobra.Command, args []string) error { return cmdListAdapters(adaptersIface) },
 	}
+	adaptersCmd.Flags().StringVarP(&adaptersIface, "interface", "i", "", "Filter by name, wildcard (*VMnet*), or regex (omit to show all)")
 
 	// ── show ─────────────────────────────────────────────────────────────────
+	var showIface string
 	showCmd := &cobra.Command{
 		Use:   "show",
-		Short: "Show DNS configuration (all active adapters, or one specific)",
+		Short: "Show DNS configuration (all active adapters, or filtered)",
 		Example: `  dnsman show
   dnsman show -i "Wi-Fi"
-  dnsman show -i "Ethernet"
   dnsman show -i "*VMnet*"
   dnsman show -i "Wi-Fi*"
   dnsman show -i "(?i)vmware.*vmnet[18]"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmdShow(ifaceName)
+			return cmdShow(showIface)
 		},
 	}
-	// Default is "" (empty) — means show all. User must pass -i for a specific one.
-	showCmd.Flags().StringVarP(&ifaceName, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (omit to show all)")
+	showCmd.Flags().StringVarP(&showIface, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (omit to show all)")
 
 	// ── set ──────────────────────────────────────────────────────────────────
+	var setIface, setPreset string
+	var setFallback bool
 	setCmd := &cobra.Command{
 		Use:   "set [ip1] [ip2] ...",
 		Short: "Set static DNS servers for an interface (auto-detects if -i omitted)",
@@ -875,14 +926,14 @@ func main() {
   dnsman set --preset cloudflare -i "*VMnet8*"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			servers := append([]string{}, args...)
-			if preset != "" {
-				p, found := dnsPresets[strings.ToLower(preset)]
+			if setPreset != "" {
+				p, found := dnsPresets[strings.ToLower(setPreset)]
 				if !found {
-					return fmt.Errorf("unknown preset %q — run 'dnsman presets' to see options", preset)
+					return fmt.Errorf("unknown preset %q — run 'dnsman presets' to see options", setPreset)
 				}
 				servers = append(servers, p...)
 			}
-			if extraFallback {
+			if setFallback {
 				seen := map[string]bool{}
 				for _, s := range servers {
 					seen[s] = true
@@ -896,13 +947,12 @@ func main() {
 			if len(servers) == 0 {
 				return fmt.Errorf("provide at least one IP address or use --preset")
 			}
-			return cmdSet(ifaceName, servers)
+			return cmdSet(setIface, servers)
 		},
 	}
-	// Default "" so cmdSet can auto-detect.
-	setCmd.Flags().StringVarP(&ifaceName, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (auto-detected if omitted)")
-	setCmd.Flags().StringVarP(&preset, "preset", "p", "", "Built-in DNS preset (cloudflare, google, quad9, …)")
-	setCmd.Flags().BoolVarP(&extraFallback, "fallback", "f", false, "Append 1.1.1.1 / 8.8.8.8 / 8.8.4.4 as extra fallbacks")
+	setCmd.Flags().StringVarP(&setIface, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (auto-detected if omitted)")
+	setCmd.Flags().StringVarP(&setPreset, "preset", "p", "", "Built-in DNS preset (cloudflare, google, quad9, …)")
+	setCmd.Flags().BoolVarP(&setFallback, "fallback", "f", false, "Append 1.1.1.1 / 8.8.8.8 / 8.8.4.4 as extra fallbacks")
 
 	// ── flush ─────────────────────────────────────────────────────────────────
 	flushCmd := &cobra.Command{
@@ -912,44 +962,50 @@ func main() {
 	}
 
 	// ── restart ───────────────────────────────────────────────────────────────
+	var restartNamed bool
 	restartCmd := &cobra.Command{
 		Use:   "restart",
 		Short: "Restart dnscache (and optionally named) via SCM, then flush cache",
 		Example: `  dnsman restart
   dnsman restart --named`,
-		RunE: func(cmd *cobra.Command, args []string) error { return cmdRestart(named) },
+		RunE: func(cmd *cobra.Command, args []string) error { return cmdRestart(restartNamed) },
 	}
-	restartCmd.Flags().BoolVarP(&named, "named", "n", false, "Also restart the BIND named service")
+	restartCmd.Flags().BoolVarP(&restartNamed, "named", "n", false, "Also restart the BIND named service")
 
 	// ── reset ─────────────────────────────────────────────────────────────────
+	var resetIface string
 	resetCmd := &cobra.Command{
 		Use:   "reset",
 		Short: "Clear static DNS — revert interface to DHCP-assigned servers",
 		Example: `  dnsman reset
-  dnsman reset -i "Ethernet"`,
+  dnsman reset -i "Ethernet"
+  dnsman reset -i "*VMnet*"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return cmdReset(ifaceName)
+			return cmdReset(resetIface)
 		},
 	}
-	// Default "" so cmdReset can auto-detect.
-	resetCmd.Flags().StringVarP(&ifaceName, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (auto-detected if omitted)")
+	resetCmd.Flags().StringVarP(&resetIface, "interface", "i", "", "Interface name, wildcard (*VMnet*), or regex (auto-detected if omitted)")
 
 	// ── test ──────────────────────────────────────────────────────────────────
+	var testHost, testIface string
 	testCmd := &cobra.Command{
 		Use:   "test [hostname]",
 		Short: "Resolve a hostname — shows IPs, timing, and PTR record",
 		Example: `  dnsman test
   dnsman test google.com
-  dnsman test --host github.com`,
+  dnsman test --host github.com
+  dnsman test google.com -i "Wi-Fi"
+  dnsman test google.com -i "*VMnet8*"`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			host := testHost
 			if len(args) > 0 {
 				host = args[0]
 			}
-			return cmdTest(host)
+			return cmdTest(host, testIface)
 		},
 	}
 	testCmd.Flags().StringVarP(&testHost, "host", "H", "example.com", "Hostname to resolve")
+	testCmd.Flags().StringVarP(&testIface, "interface", "i", "", "Use this adapter's DNS servers (name, wildcard, or regex)")
 
 	// ── presets ───────────────────────────────────────────────────────────────
 	presetsCmd := &cobra.Command{
